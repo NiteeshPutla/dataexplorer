@@ -1,140 +1,668 @@
 import streamlit as st
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import json
-import re
+import requests
+import os
 
-# Set up the page configuration
-st.set_page_config(layout="wide", page_title="NL Data Explorer", page_icon="📈")
+# Try to use Groq first, fallback to Gemini if needed
+def get_ai_client():
+    if "GROQ_API_KEY" in st.secrets:
+        return "groq"
+    elif "GEMINI_API_KEY" in st.secrets:
+        return "gemini"
+    else:
+        return "local"  # Use local fallback when no API keys are available
 
-# --- Session State Management ---
+
+def filter_dataframe(column: str, operator: str, value: str):
+    df = st.session_state.df
+    try:
+        value_num = pd.to_numeric(value, errors='ignore')
+    except Exception:
+        value_num = value
+    if operator == 'greater_than':
+        return df[df[column] > value_num]
+    elif operator == 'less_than':
+        return df[df[column] < value_num]
+    elif operator == 'equals':
+        return df[df[column] == value_num]
+    else:
+        return df
+
+def sort_dataframe(column: str, ascending: bool = True):
+    df = st.session_state.df
+    return df.sort_values(by=column, ascending=ascending)
+
+def group_and_aggregate(group_by_col: str, agg_col: str, agg_func: str):
+    df = st.session_state.df
+    if agg_func == 'sum':
+        return df.groupby(group_by_col)[agg_col].sum().reset_index()
+    elif agg_func == 'mean':
+        return df.groupby(group_by_col)[agg_col].mean().reset_index()
+    elif agg_func == 'count':
+        return df.groupby(group_by_col)[agg_col].count().reset_index()
+    elif agg_func == 'max':
+        return df.groupby(group_by_col)[agg_col].max().reset_index()
+    elif agg_func == 'min':
+        return df.groupby(group_by_col)[agg_col].min().reset_index()
+    else:
+        return df
+
+def pivot_table(index_col: str, columns_col: str, values_col: str, agg_func: str = 'sum'):
+    df = st.session_state.df
+    try:
+        pivot_df = df.pivot_table(
+            index=index_col, 
+            columns=columns_col, 
+            values=values_col, 
+            aggfunc=agg_func,
+            fill_value=0
+        ).reset_index()
+        return pivot_df
+    except Exception as e:
+        st.error(f"Error creating pivot table: {e}")
+        return df
+
+def create_visualization(chart_type: str, x_col: str, y_col: str, title: str = None):
+    df = st.session_state.df
+    if df.empty:
+        return None
+    
+    if chart_type == 'bar':
+        return px.bar(df, x=x_col, y=y_col, title=title or f"Bar Chart: {y_col} by {x_col}")
+    elif chart_type == 'line':
+        return px.line(df, x=x_col, y=y_col, title=title or f"Line Chart: {y_col} by {x_col}")
+    elif chart_type == 'pie':
+        return px.pie(df, names=x_col, values=y_col, title=title or f"Pie Chart: {y_col} by {x_col}")
+    elif chart_type == 'scatter':
+        return px.scatter(df, x=x_col, y=y_col, title=title or f"Scatter Plot: {y_col} vs {x_col}")
+    elif chart_type == 'histogram':
+        return px.histogram(df, x=x_col, title=title or f"Histogram: {x_col}")
+    elif chart_type == 'box':
+        return px.box(df, x=x_col, y=y_col, title=title or f"Box Plot: {y_col} by {x_col}")
+    else:
+        return px.bar(df, x=x_col, y=y_col, title=title or f"Chart: {y_col} by {x_col}")
+
+
+# Function declarations will be created when needed for Gemini API
+
 if 'df' not in st.session_state:
     st.session_state.df = pd.DataFrame()
 if 'original_df' not in st.session_state:
     st.session_state.original_df = pd.DataFrame()
 if 'operation_history' not in st.session_state:
     st.session_state.operation_history = []
-if 'current_view' not in st.session_state:
-    st.session_state.current_view = 'table'  # 'table', 'chart'
-if 'chart_type' not in st.session_state:
-    st.session_state.chart_type = 'bar'
 if 'last_command' not in st.session_state:
     st.session_state.last_command = ""
-if 'suggestion_options' not in st.session_state:
-    st.session_state.suggestion_options = []
+if 'current_view' not in st.session_state:
+    st.session_state.current_view = 'table'
+if 'suggestions' not in st.session_state:
+    st.session_state.suggestions = []
+if 'selected_suggestion' not in st.session_state:
+    st.session_state.selected_suggestion = None
 
-# --- Helper Functions (Mocking the NLP/Backend Logic) ---
-def parse_command(command, df):
-    """
-    Mocks a natural language parsing function.
-    It returns a list of possible operations based on the command.
-    Each operation is a dictionary with 'operation', 'description', and 'params'.
-    """
-    command = command.lower()
-    options = []
-    
-    # Example 1: 'show seasonality by region' -> Group by region, count/sum over time
-    if any(word in command for word in ['seasonality', 'by region', 'time series']):
-        if 'region' in df.columns and 'date' in df.columns:
-            options.append({
-                'operation': 'pivot_table',
-                'description': 'Show seasonality of sales by region',
-                'params': {
-                    'index': 'date', 
-                    'columns': 'region', 
-                    'values': 'sales', 
-                    'aggfunc': 'sum'
-                }
-            })
-            options.append({
-                'operation': 'group_by_count',
-                'description': 'Group by region and month to show count of items sold',
-                'params': {
-                    'group_col': 'region', 
-                    'date_col': 'date'
-                }
-            })
-        else:
-            options.append({
-                'operation': 'info_text',
-                'description': "Could not find 'region' and 'date' columns to show seasonality.",
-                'params': {}
-            })
-    
-    # Example 2: 'top 5 products this quarter' -> Filter by date, sort, head
-    elif any(word in command for word in ['top 5', 'best sellers', 'top products']):
-        if 'product' in df.columns and 'sales' in df.columns:
-            options.append({
-                'operation': 'top_n',
-                'description': 'Show top 5 products by sales',
-                'params': {
-                    'n': 5,
-                    'by_column': 'sales',
-                    'sort_column': 'product'
-                }
-            })
-            options.append({
-                'operation': 'top_n',
-                'description': 'Show top 5 products by number of unique customers',
-                'params': {
-                    'n': 5,
-                    'by_column': 'customer_id',
-                    'sort_column': 'product',
-                    'agg_func': 'nunique'
-                }
-            })
-    
-    # Example 3: Simple filters and sorts
-    elif 'filter' in command or 'sort' in command or 'show only' in command:
-        col_match = re.search(r'by (\w+)', command)
-        val_match = re.search(r'is (\w+)', command)
+
+def call_groq_api(prompt, max_tokens=2000):
+    """Call Groq API for text generation"""
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {st.secrets['GROQ_API_KEY']}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.7,
+            "stream": False
+        }
+        response = requests.post(url, headers=headers, json=data)
         
-        if col_match and val_match and col_match.group(1) in df.columns:
-            options.append({
-                'operation': 'filter',
-                'description': f"Filter where {col_match.group(1)} is {val_match.group(1)}",
-                'params': {
-                    'column': col_match.group(1),
-                    'value': val_match.group(1)
+        # Better error handling
+        if response.status_code != 200:
+            error_detail = response.text
+            st.error(f"Groq API error {response.status_code}: {error_detail}")
+            return None
+            
+        response_data = response.json()
+        if "choices" not in response_data or len(response_data["choices"]) == 0:
+            st.error("No response from Groq API")
+            return None
+            
+        return response_data["choices"][0]["message"]["content"]
+    except requests.exceptions.RequestException as e:
+        st.error(f"Network error calling Groq API: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Groq API error: {e}")
+        return None
+
+def call_gemini_api(prompt):
+    """Call Gemini API (fallback)"""
+    try:
+        from google import genai
+        from google.genai import types
+        
+        # Create function declarations for Gemini
+        filter_decl = types.FunctionDeclaration(
+            name="filter_dataframe",
+            description="Filter dataframe by column, operator, and value",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "column": {"type": "string"},
+                    "operator": {"type": "string", "enum": ["greater_than", "less_than", "equals"]},
+                    "value": {"type": "string"},
+                },
+                "required": ["column", "operator", "value"],
+            },
+        )
+
+        sort_decl = types.FunctionDeclaration(
+            name="sort_dataframe",
+            description="Sort dataframe by column and order",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "column": {"type": "string"},
+                    "ascending": {"type": "boolean"},
+                },
+                "required": ["column"],
+            },
+        )
+
+        group_decl = types.FunctionDeclaration(
+            name="group_and_aggregate",
+            description="Group dataframe and apply aggregation",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "group_by_col": {"type": "string"},
+                    "agg_col": {"type": "string"},
+                    "agg_func": {"type": "string", "enum": ["sum", "mean", "count", "max", "min"]},
+                },
+                "required": ["group_by_col", "agg_col", "agg_func"],
+            },
+        )
+
+        pivot_decl = types.FunctionDeclaration(
+            name="pivot_table",
+            description="Create a pivot table from the dataframe",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "index_col": {"type": "string"},
+                    "columns_col": {"type": "string"},
+                    "values_col": {"type": "string"},
+                    "agg_func": {"type": "string", "enum": ["sum", "mean", "count", "max", "min"], "default": "sum"},
+                },
+                "required": ["index_col", "columns_col", "values_col"],
+            },
+        )
+
+        visualization_decl = types.FunctionDeclaration(
+            name="create_visualization",
+            description="Create a chart visualization of the data",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "chart_type": {"type": "string", "enum": ["bar", "line", "pie", "scatter", "histogram", "box"]},
+                    "x_col": {"type": "string"},
+                    "y_col": {"type": "string"},
+                    "title": {"type": "string"},
+                },
+                "required": ["chart_type", "x_col", "y_col"],
+            },
+        )
+
+        tools = [
+            types.Tool(function_declarations=[filter_decl]),
+            types.Tool(function_declarations=[sort_decl]),
+            types.Tool(function_declarations=[group_decl]),
+            types.Tool(function_declarations=[pivot_decl]),
+            types.Tool(function_declarations=[visualization_decl]),
+        ]
+        
+        client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+        response = client.models.generate_content(
+            model="gemini-1.5-pro",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=tools,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig()
+            )
+        )
+        return response
+    except Exception as e:
+        st.error(f"Gemini API error: {e}")
+        return None
+
+def generate_multiple_suggestions(command, df_info):
+    try:
+        df_columns = df_info.columns.tolist()
+        df_description = df_info.describe().to_string()
+        prompt = (
+            f"Given the following data with columns: {df_columns}, and the summary statistics:\n"
+            f"{df_description}\n"
+            f"The user wants to: '{command}'.\n"
+            f"Generate 3 different interpretations of this request. Each interpretation should:\n"
+            f"1. Use a different approach or focus\n"
+            f"2. Be specific about which columns to use\n"
+            f"3. Include a chart type if visualization is appropriate\n"
+            f"4. Be clear and actionable\n"
+            f"Return as JSON array with format: [{{'description': 'what this does', 'function': 'function_name', 'args': {{...}}, 'chart_type': 'optional'}}]"
+        )
+
+        ai_client = get_ai_client()
+        
+        # Try external APIs first, fallback to local processing
+        if ai_client == "groq":
+            try:
+                response_text = call_groq_api(prompt)
+                if not response_text:
+                    raise Exception("Groq API failed")
+            except Exception as e:
+                st.warning(f"Groq API failed: {e}, using local suggestions")
+                return create_local_suggestions(command, df_info)
+        elif ai_client == "gemini":
+            try:
+                response = call_gemini_api(prompt)
+                if not response:
+                    raise Exception("Gemini API failed")
+                response_text = response.text
+            except Exception as e:
+                st.warning(f"Gemini API failed: {e}, using local suggestions")
+                return create_local_suggestions(command, df_info)
+        else:
+            # Use local processing
+            return create_local_suggestions(command, df_info)
+
+        # Parse the response to extract suggestions
+        try:
+            # Extract JSON from the response
+            if "```json" in response_text:
+                json_start = response_text.find("```json") + 7
+                json_end = response_text.find("```", json_start)
+                suggestions_text = response_text[json_start:json_end]
+            elif "[" in response_text and "]" in response_text:
+                json_start = response_text.find("[")
+                json_end = response_text.rfind("]") + 1
+                suggestions_text = response_text[json_start:json_end]
+            else:
+                suggestions_text = response_text
+            
+            suggestions = json.loads(suggestions_text.strip())
+            return suggestions[:3]  # Return max 3 suggestions
+        except json.JSONDecodeError:
+            # Fallback: create basic suggestions
+            return [
+                {
+                    "description": f"Show data filtered and sorted for: {command}",
+                    "function": "filter_dataframe",
+                    "args": {"column": df_columns[0], "operator": "equals", "value": "all"},
+                    "chart_type": "bar"
+                },
+                {
+                    "description": f"Group and aggregate data for: {command}",
+                    "function": "group_and_aggregate", 
+                    "args": {"group_by_col": df_columns[0], "agg_col": df_columns[1] if len(df_columns) > 1 else df_columns[0], "agg_func": "sum"},
+                    "chart_type": "pie"
+                },
+                {
+                    "description": f"Create visualization for: {command}",
+                    "function": "create_visualization",
+                    "args": {"chart_type": "bar", "x_col": df_columns[0], "y_col": df_columns[1] if len(df_columns) > 1 else df_columns[0]},
+                    "chart_type": "bar"
                 }
-            })
+            ]
+    except Exception as e:
+        st.error(f"An error occurred while generating suggestions: {e}")
+        return []
+
+def process_command_with_llm(command, df_info):
+    try:
+        df_columns = df_info.columns.tolist()
+        df_description = df_info.describe().to_string()
+        
+        # Create a simple prompt for direct execution
+        prompt = (
+            f"Given the following data with columns: {df_columns}, and the summary statistics:\n"
+            f"{df_description}\n"
+            f"The user wants to: '{command}'.\n\n"
+            f"IMPORTANT: You must respond with ONLY a valid JSON object in this exact format:\n"
+            f"{{\n"
+            f'  "function": "function_name",\n'
+            f'  "args": {{...}}\n'
+            f"}}\n\n"
+            f"Available functions and their parameters:\n"
+            f"- filter_dataframe: {{'column': 'col_name', 'operator': 'greater_than/less_than/equals', 'value': 'value'}}\n"
+            f"- sort_dataframe: {{'column': 'col_name', 'ascending': true/false}}\n"
+            f"- group_and_aggregate: {{'group_by_col': 'col_name', 'agg_col': 'col_name', 'agg_func': 'sum/mean/count/max/min'}}\n"
+            f"- pivot_table: {{'index_col': 'col_name', 'columns_col': 'col_name', 'values_col': 'col_name', 'agg_func': 'sum/mean/count/max/min'}}\n"
+            f"- create_visualization: {{'chart_type': 'bar/line/pie/scatter/histogram/box', 'x_col': 'col_name', 'y_col': 'col_name', 'title': 'optional'}}\n\n"
+            f"Choose the most appropriate function and provide the exact JSON response:"
+        )
+
+        ai_client = get_ai_client()
+        
+        # Try external APIs first, fallback to local processing
+        if ai_client == "groq":
+            try:
+                response_text = call_groq_api(prompt)
+                if response_text:
+                    # Parse JSON response
+                    try:
+                        # Clean up the response text
+                        if "```json" in response_text:
+                            json_start = response_text.find("```json") + 7
+                            json_end = response_text.find("```", json_start)
+                            response_text = response_text[json_start:json_end]
+                        elif "{" in response_text and "}" in response_text:
+                            json_start = response_text.find("{")
+                            json_end = response_text.rfind("}") + 1
+                            response_text = response_text[json_start:json_end]
+                        
+                        # Try to parse the JSON
+                        result = json.loads(response_text.strip())
+                        
+                        # Check if we have the required keys
+                        if 'function' not in result or 'args' not in result:
+                            st.warning(f"AI response missing required keys. Got: {list(result.keys())}")
+                            return local_ai_processor(command, df_info)
+                        
+                        # Convert to function call format
+                        class FunctionCall:
+                            def __init__(self, name, args):
+                                self.name = name
+                                self.args = args
+                        
+                        return FunctionCall(result['function'], result['args'])
+                    except (json.JSONDecodeError, KeyError) as e:
+                        st.warning(f"Could not parse AI response: {e}")
+                        return local_ai_processor(command, df_info)
+                else:
+                    st.warning("Groq API failed, using local processing")
+                    return local_ai_processor(command, df_info)
+            except Exception as e:
+                st.warning(f"Groq API error: {e}, using local processing")
+                return local_ai_processor(command, df_info)
+                
+        elif ai_client == "gemini":
+            try:
+                response = call_gemini_api(prompt)
+                if response:
+                    function_calls = response.function_calls
+                    if function_calls and len(function_calls) > 0:
+                        return function_calls[0]
+                    else:
+                        return local_ai_processor(command, df_info)
+                else:
+                    st.warning("Gemini API failed, using local processing")
+                    return local_ai_processor(command, df_info)
+            except Exception as e:
+                st.warning(f"Gemini API error: {e}, using local processing")
+                return local_ai_processor(command, df_info)
+        else:
+            # Use local processing
+            st.info("Using local processing (no API keys configured)")
+            return local_ai_processor(command, df_info)
+    except Exception as e:
+        st.error(f"An error occurred while processing your request: {e}")
+        st.info("The model may not have been able to find a suitable tool.")
+        return None
+
+def create_local_suggestions(command, df_info):
+    """Create local suggestions without external API calls"""
+    df_columns = df_info.columns.tolist()
+    command_lower = command.lower()
     
-    # Default/Vague command
-    if not options:
-        options.append({
-            'operation': 'info_text',
-            'description': "Sorry, I'm not sure what you mean. Please try a different command.",
-            'params': {}
+    suggestions = []
+    
+    # Suggestion 1: Visualization
+    if any(word in command_lower for word in ['chart', 'graph', 'plot', 'visualize', 'show']):
+        chart_type = "bar"
+        if 'pie' in command_lower:
+            chart_type = "pie"
+        elif 'line' in command_lower:
+            chart_type = "line"
+        elif 'scatter' in command_lower:
+            chart_type = "scatter"
+            
+        suggestions.append({
+            "description": f"Create a {chart_type} chart visualization",
+            "function": "create_visualization",
+            "args": {
+                "chart_type": chart_type,
+                "x_col": df_columns[0],
+                "y_col": df_columns[1] if len(df_columns) > 1 else df_columns[0]
+            },
+            "chart_type": chart_type
+        })
+    
+    # Suggestion 2: Group and Aggregate
+    if any(word in command_lower for word in ['group', 'sum', 'total', 'aggregate', 'by']):
+        agg_func = "sum"
+        if 'average' in command_lower or 'mean' in command_lower:
+            agg_func = "mean"
+        elif 'count' in command_lower:
+            agg_func = "count"
+            
+        suggestions.append({
+            "description": f"Group data and calculate {agg_func}",
+            "function": "group_and_aggregate",
+            "args": {
+                "group_by_col": df_columns[0],
+                "agg_col": df_columns[1] if len(df_columns) > 1 else df_columns[0],
+                "agg_func": agg_func
+            },
+            "chart_type": "bar"
+        })
+    
+    # Suggestion 3: Sort
+    if any(word in command_lower for word in ['sort', 'order', 'top', 'bottom']):
+        ascending = "top" not in command_lower
+        suggestions.append({
+            "description": f"Sort data by {df_columns[0]} ({'ascending' if ascending else 'descending'})",
+            "function": "sort_dataframe",
+            "args": {
+                "column": df_columns[0],
+                "ascending": ascending
+            },
+            "chart_type": "bar"
+        })
+    
+    # If no specific suggestions, create generic ones
+    if not suggestions:
+        suggestions = [
+            {
+                "description": f"Create a bar chart of {df_columns[0]} vs {df_columns[1] if len(df_columns) > 1 else df_columns[0]}",
+                "function": "create_visualization",
+                "args": {
+                    "chart_type": "bar",
+                    "x_col": df_columns[0],
+                    "y_col": df_columns[1] if len(df_columns) > 1 else df_columns[0]
+                },
+                "chart_type": "bar"
+            },
+            {
+                "description": f"Group by {df_columns[0]} and sum {df_columns[1] if len(df_columns) > 1 else df_columns[0]}",
+                "function": "group_and_aggregate",
+                "args": {
+                    "group_by_col": df_columns[0],
+                    "agg_col": df_columns[1] if len(df_columns) > 1 else df_columns[0],
+                    "agg_func": "sum"
+                },
+                "chart_type": "pie"
+            },
+            {
+                "description": f"Sort data by {df_columns[0]}",
+                "function": "sort_dataframe",
+                "args": {
+                    "column": df_columns[0],
+                    "ascending": False
+                },
+                "chart_type": "bar"
+            }
+        ]
+    
+    return suggestions[:3]  # Return max 3 suggestions
+
+def local_ai_processor(command, df_info):
+    """Local AI processor using keyword matching - no external API needed"""
+    df_columns = df_info.columns.tolist()
+    command_lower = command.lower()
+    
+    class FunctionCall:
+        def __init__(self, name, args):
+            self.name = name
+            self.args = args
+    
+    # Enhanced keyword matching
+    if any(word in command_lower for word in ['chart', 'graph', 'plot', 'visualize', 'pie', 'bar', 'line', 'scatter']):
+        chart_type = "bar"
+        if 'pie' in command_lower:
+            chart_type = "pie"
+        elif 'line' in command_lower:
+            chart_type = "line"
+        elif 'scatter' in command_lower:
+            chart_type = "scatter"
+        elif 'histogram' in command_lower:
+            chart_type = "histogram"
+        elif 'box' in command_lower:
+            chart_type = "box"
+            
+        return FunctionCall("create_visualization", {
+            "chart_type": chart_type,
+            "x_col": df_columns[0],
+            "y_col": df_columns[1] if len(df_columns) > 1 else df_columns[0],
+            "title": f"Chart: {command}"
+        })
+    
+    elif any(word in command_lower for word in ['group', 'sum', 'total', 'aggregate', 'by']):
+        agg_func = "sum"
+        if 'average' in command_lower or 'mean' in command_lower:
+            agg_func = "mean"
+        elif 'count' in command_lower:
+            agg_func = "count"
+        elif 'max' in command_lower or 'maximum' in command_lower:
+            agg_func = "max"
+        elif 'min' in command_lower or 'minimum' in command_lower:
+            agg_func = "min"
+            
+        return FunctionCall("group_and_aggregate", {
+            "group_by_col": df_columns[0],
+            "agg_col": df_columns[1] if len(df_columns) > 1 else df_columns[0],
+            "agg_func": agg_func
+        })
+    
+    elif any(word in command_lower for word in ['sort', 'order', 'top', 'bottom', 'highest', 'lowest']):
+        ascending = True
+        if any(word in command_lower for word in ['top', 'highest', 'desc']):
+            ascending = False
+            
+        return FunctionCall("sort_dataframe", {
+            "column": df_columns[0],
+            "ascending": ascending
+        })
+    
+    elif any(word in command_lower for word in ['pivot', 'cross', 'table']):
+        return FunctionCall("pivot_table", {
+            "index_col": df_columns[0],
+            "columns_col": df_columns[1] if len(df_columns) > 1 else df_columns[0],
+            "values_col": df_columns[2] if len(df_columns) > 2 else df_columns[1] if len(df_columns) > 1 else df_columns[0],
+            "agg_func": "sum"
+        })
+    
+    elif any(word in command_lower for word in ['filter', 'where', 'show only', 'find']):
+        return FunctionCall("filter_dataframe", {
+            "column": df_columns[0],
+            "operator": "equals",
+            "value": "all"
+        })
+    
+    else:
+        # Default to showing the data with a chart
+        return FunctionCall("create_visualization", {
+            "chart_type": "bar",
+            "x_col": df_columns[0],
+            "y_col": df_columns[1] if len(df_columns) > 1 else df_columns[0],
+            "title": f"Data View: {command}"
         })
 
-    return options
-
-def apply_operation(df, operation_dict):
-    """Applies a single operation and returns the modified DataFrame."""
-    op = operation_dict['operation']
-    params = operation_dict['params']
+def create_fallback_suggestion(command, df_columns):
+    """Create a simple fallback suggestion when AI response is malformed"""
+    class FunctionCall:
+        def __init__(self, name, args):
+            self.name = name
+            self.args = args
     
-    if op == 'pivot_table':
-        df = pd.pivot_table(df, **params).reset_index()
-    elif op == 'top_n':
-        agg_func = params.get('agg_func', 'sum')
-        if agg_func == 'sum':
-            df = df.groupby(params['sort_column']).agg({params['by_column']: 'sum'}).nlargest(params['n'], params['by_column']).reset_index()
-        elif agg_func == 'nunique':
-            df = df.groupby(params['sort_column']).agg({params['by_column']: 'nunique'}).nlargest(params['n'], params['by_column']).reset_index()
-    elif op == 'filter':
-        df = df[df[params['column']] == params['value']]
-    elif op == 'group_by_count':
-        df['month'] = pd.to_datetime(df[params['date_col']]).dt.to_period('M')
-        df = df.groupby([params['group_col'], 'month']).size().reset_index(name='count')
-        df['month'] = df['month'].astype(str)
+    # Simple heuristics based on command keywords
+    command_lower = command.lower()
     
-    return df
+    if any(word in command_lower for word in ['chart', 'graph', 'plot', 'visualize', 'pie', 'bar', 'line']):
+        return FunctionCall("create_visualization", {
+            "chart_type": "bar",
+            "x_col": df_columns[0],
+            "y_col": df_columns[1] if len(df_columns) > 1 else df_columns[0]
+        })
+    elif any(word in command_lower for word in ['group', 'sum', 'total', 'aggregate']):
+        return FunctionCall("group_and_aggregate", {
+            "group_by_col": df_columns[0],
+            "agg_col": df_columns[1] if len(df_columns) > 1 else df_columns[0],
+            "agg_func": "sum"
+        })
+    elif any(word in command_lower for word in ['sort', 'order', 'top', 'bottom']):
+        return FunctionCall("sort_dataframe", {
+            "column": df_columns[0],
+            "ascending": "top" not in command_lower
+        })
+    else:
+        # Default to showing the data
+        return FunctionCall("create_visualization", {
+            "chart_type": "bar",
+            "x_col": df_columns[0],
+            "y_col": df_columns[1] if len(df_columns) > 1 else df_columns[0]
+        })
 
-# --- UI Components ---
+def apply_suggestion(function_name, function_args, description):
+    """Apply a suggestion to the dataframe"""
+    try:
+        if function_name in functions:
+            new_df = functions[function_name](**function_args)
+            if isinstance(new_df, pd.DataFrame):
+                st.session_state.df = new_df
+                st.session_state.operation_history.append({
+                    'description': description,
+                    'params': function_args,
+                    'function': function_name
+                })
+                st.success(f"Applied: {description}")
+                st.session_state.current_view = 'table'
+            else:
+                st.error("Function did not return a DataFrame.")
+        else:
+            st.error(f"Unknown function: {function_name}")
+    except Exception as e:
+        st.error(f"Failed to apply the function: {e}")
+
+# Map the function names to Python functions for local execution
+functions = {
+    "filter_dataframe": filter_dataframe,
+    "sort_dataframe": sort_dataframe,
+    "group_and_aggregate": group_and_aggregate,
+    "pivot_table": pivot_table,
+    "create_visualization": create_visualization,
+}
+
+# Streamlit app UI and logic --------------------------------------------------
+
+st.set_page_config(layout="wide", page_title="NL Data Explorer", page_icon="📈")
 st.title("📊 NL Data Explorer")
 st.markdown("Talk, don't tool. Describe your needs in plain language and get a useful view.")
 
-# --- Sidebar for File Upload and History ---
 with st.sidebar:
     st.header("Upload Data")
     uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
@@ -151,45 +679,54 @@ with st.sidebar:
     for i, op in enumerate(st.session_state.operation_history):
         st.markdown(f"**Step {i+1}:** {op['description']}")
 
-# --- Main Content Area ---
 if not st.session_state.df.empty:
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        # --- Command Box ---
         st.subheader("What do you want to see?")
-        command = st.text_input("Enter your command here...", value=st.session_state.last_command)
-        
-        if st.button("Apply Command"):
-            if command:
-                st.session_state.last_command = command
-                st.session_state.suggestion_options = parse_command(command, st.session_state.original_df)
-            else:
-                st.warning("Please enter a command.")
-        
-        # --- Suggestions Panel ---
-        if st.session_state.suggestion_options:
-            st.markdown("---")
-            st.subheader("I have a few ideas...")
-            st.write("Please select the one that best matches your intent:")
-            
-            for i, option in enumerate(st.session_state.suggestion_options):
-                if st.button(f"Option {i+1}: {option['description']}", key=f"suggestion_btn_{i}"):
-                    # Apply the chosen operation
-                    st.session_state.df = apply_operation(st.session_state.original_df.copy(), option)
-                    st.session_state.operation_history.append(option)
-                    st.session_state.suggestion_options = [] # Clear suggestions
-                    st.success(f"Applied: {option['description']}")
-                    
-                    # Heuristically decide on view type
-                    if 'pivot' in option['operation'] or 'group' in option['operation']:
-                        st.session_state.current_view = 'chart'
-                        st.session_state.chart_type = 'bar'
-                    else:
-                        st.session_state.current_view = 'table'
+        command = st.text_input("Enter your command here...", value=st.session_state.last_command, key="command_input")
 
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            if st.button("Get Suggestions", type="primary"):
+                if command:
+                    st.session_state.last_command = command
+                    with st.spinner("Generating suggestions..."):
+                        st.session_state.suggestions = generate_multiple_suggestions(command, st.session_state.original_df)
+                else:
+                    st.warning("Please enter a command.")
+        
+        with col_btn2:
+            if st.button("Apply Directly"):
+                if command:
+                    st.session_state.last_command = command
+                    with st.spinner("Thinking..."):
+                        llm_call = process_command_with_llm(command, st.session_state.original_df)
+
+                    if llm_call:
+                        function_name = llm_call.name
+                        function_args = llm_call.args
+                        apply_suggestion(function_name, function_args, "Direct application")
+                    else:
+                        st.warning("The model could not determine a suitable action. Try getting suggestions instead.")
+                else:
+                    st.warning("Please enter a command.")
+
+        # Suggestions Panel
+        if st.session_state.suggestions:
+            st.markdown("---")
+            st.subheader("💡 Choose Your Interpretation")
+            st.markdown("**Your command:** " + command)
+            st.markdown("**Here are 3 different ways to interpret your request:**")
+            
+            for i, suggestion in enumerate(st.session_state.suggestions):
+                with st.expander(f"Option {i+1}: {suggestion['description']}", expanded=False):
+                    st.json(suggestion)
+                    if st.button(f"Apply Option {i+1}", key=f"apply_{i}"):
+                        apply_suggestion(suggestion['function'], suggestion['args'], suggestion['description'])
+                        st.session_state.suggestions = []  # Clear suggestions after applying
+                        st.rerun()
     with col2:
-        # --- Operation Explain Panel ---
         st.subheader("Current View Explained")
         if st.session_state.operation_history:
             last_op = st.session_state.operation_history[-1]
@@ -198,32 +735,39 @@ if not st.session_state.df.empty:
             st.json(last_op['params'])
         else:
             st.info("No operations applied yet. This is a preview of the raw data.")
-    
+
     st.markdown("---")
-    
-    # --- Chart/Table Area and Export ---
     st.subheader("Data View")
-    
+
     if st.session_state.current_view == 'table':
         st.dataframe(st.session_state.df)
-    else:
-        # Simple chart generation based on the current DataFrame
+
         if len(st.session_state.df.columns) >= 2:
-            st.subheader("Chart View")
+            st.markdown("---")
+            st.subheader("📊 Quick Chart Visualizations")
+            
+            # Chart type selector
+            chart_types = ['bar', 'line', 'pie', 'scatter', 'histogram', 'box']
+            selected_charts = st.multiselect(
+                "Select chart types to display:",
+                chart_types,
+                default=['bar', 'pie']
+            )
+            
             x_col = st.session_state.df.columns[0]
-            y_col = st.session_state.df.columns[1]
+            y_col = st.session_state.df.columns[1] if len(st.session_state.df.columns) > 1 else st.session_state.df.columns[0]
             
-            chart_options = ['bar chart', 'line chart', 'area chart']
-            selected_chart = st.selectbox("Choose a chart type:", chart_options)
-            
-            if selected_chart == 'bar chart':
-                st.bar_chart(st.session_state.df, x=x_col, y=y_col)
-            elif selected_chart == 'line chart':
-                st.line_chart(st.session_state.df, x=x_col, y=y_col)
-            elif selected_chart == 'area chart':
-                st.area_chart(st.session_state.df, x=x_col, y=y_col)
-    
-    # --- Export Button ---
+            # Display selected charts
+            for chart_type in selected_charts:
+                try:
+                    fig = create_visualization(chart_type, x_col, y_col)
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+                except Exception as e:
+                    st.warning(f"Could not create {chart_type} chart: {e}")
+
+            st.info("💡 **Tip:** Ask for specific charts using commands like 'show a pie chart of sales by region' or 'create a bar graph of top products'.")
+
     st.markdown("---")
     st.subheader("Export")
     csv_export = st.session_state.df.to_csv(index=False).encode('utf-8')
@@ -233,6 +777,5 @@ if not st.session_state.df.empty:
         file_name='data_explorer_export.csv',
         mime='text/csv',
     )
-
 else:
     st.info("Please upload a CSV file to begin.")
